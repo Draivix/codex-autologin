@@ -1,0 +1,29 @@
+{
+  "_doc_": "DO NOT COMMIT. Mode 600. Use apikey_admin.py to manage.",
+  "keys": {
+    "key_EXAMPLE_admin": {
+      "label": "admin",
+      "hash": "sha256_hex_of_plaintext_key_here",
+      "scope": ["*"],
+      "created_at": "2026-05-12T07:00:00+00:00",
+      "rate_limit": 30,
+      "ip_allowlist": [],
+      "max_uses": null,
+      "use_count": 0,
+      "last_used_at": null,
+      "revoked": false
+    },
+    "key_EXAMPLE_dev1": {
+      "label": "dev1 - alice machine",
+      "hash": "sha256_hex_of_plaintext_key_here",
+      "scope": ["alice", "carol"],
+      "created_at": "2026-05-12T07:00:00+00:00",
+      "rate_limit": 10,
+      "ip_allowlist": ["10.0.0.0/8", "203.0.113.0/24"],
+      "max_uses": null,
+      "use_count": 0,
+      "last_used_at": null,
+      "revoked": false
+    }
+  }
+}

@@ -56,6 +56,11 @@ This repo solves all four with about 500 lines of Python.
 | `codex_autologin.py` | The autologin. Spawns `codex login`, drives `auth.openai.com` with Camoufox, fetches the OTP via IMAP, lets codex write `auth.json`. |
 | `codex_status.py` | CLI: calls `/backend-api/wham/usage` for every logged-in account; prints plan + 5h/7d rate-limit windows + credits as a table. |
 | `status_ui.py` | Flask web dashboard for the same data. Auto-refreshing color-coded bars, served at `http://127.0.0.1:8765`. |
+| `auth_api.py` | Flask API that distributes `auth.json` files to authorized clients over HTTPS (front with nginx). Bearer-token auth, per-key account scoping, rate limit, append-only audit log. |
+| `apikey_admin.py` | CLI for the API: `generate`, `list`, `revoke`, `rotate`, `delete` keys. Stores only SHA-256 hashes; plaintext shown once at mint. |
+| `client_fetch.py` | Client side of the API: downloads `auth.json` from a remote `auth_api` server into a local `$CODEX_HOME`. |
+| `nginx.example.conf` | Reference nginx config: TLS termination, security headers, rate-limit zone, request-line-only access log (no Authorization leakage). |
+| `codex-auth-api.service` | Hardened systemd unit: `NoNewPrivileges`, `ProtectSystem=strict`, `MemoryDenyWriteExecute`, syscall filter. |
 | `codex_as` | Tiny shell wrapper: `./codex_as <account> [codex args]` runs codex with the right `CODEX_HOME` and `BROWSER=true`. |
 | `accounts.example.json` | Template — copy to `accounts.json`, chmod 600, fill in real values. |
 | `homes/<account>/auth.json` | Per-account state, created by codex itself. **Never** committed. |
@@ -227,6 +232,110 @@ under each account. It refreshes itself every 60 seconds and caches the
 upstream call for 15 s so OpenAI is not hammered.
 
 `GET /api/status` returns the same data as JSON for programmatic use.
+
+## Distributing `auth.json` to remote clients (the API)
+
+Once your accounts are logged in, you usually don't want every dev machine
+re-running the browser flow. `auth_api.py` is a small Flask service that
+hands out the existing `homes/<account>/auth.json` files to authorized
+clients over HTTPS.
+
+### Threat model & design
+
+- The server binds **127.0.0.1 only**. TLS terminates at nginx (see
+  `nginx.example.conf`). The Python service never speaks plaintext to the
+  internet.
+- Bearer-token authentication via `Authorization: Bearer ck_live_<32 bytes>`.
+  Tokens are 32-byte random; the server stores only SHA-256 hashes.
+- **Per-key account scoping**: every key has a `scope` list of account
+  names. Scope `["*"]` is admin (all accounts + can trigger re-logins).
+- Token-bucket **rate limit** per key (default 30 req/min, tunable).
+- Optional **IP allowlist** (CIDR list) per key.
+- Optional **`max_uses`** for one-shot or finite-use keys.
+- **Append-only JSONL audit log** (`audit.log`) of every request: timestamp,
+  IP, key_id, account, action, status. Failures are logged too.
+- Scope misses return **404** (not 403) so a key cannot enumerate
+  account names it does not own.
+- `Cache-Control: no-store`, HSTS, `X-Content-Type-Options`, `Referrer-Policy`
+  set on every response.
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+| ------ | ---- | ---- | ----------- |
+| `GET`  | `/v1/health` | none | liveness probe |
+| `GET`  | `/v1/accounts` | bearer | list accounts the key can access |
+| `GET`  | `/v1/accounts/<name>/status` | bearer | live `/wham/usage` for that account |
+| `GET`  | `/v1/accounts/<name>/auth` | bearer | **the auth.json** (secret) |
+| `POST` | `/v1/accounts/<name>/refresh` | admin | trigger `codex_autologin.py --force` |
+
+### Setup on the central server
+
+```bash
+pip install flask waitress
+
+# 1. mint keys
+python3 apikey_admin.py generate --label admin --scope '*'
+python3 apikey_admin.py generate --label dev1 --scope alice,carol \
+        --rate-limit 10 --ip-allowlist 10.0.0.0/8
+
+# both commands print the plaintext key ONCE — copy it to the client now.
+
+# 2. start the API (waitress in production)
+python3 auth_api.py --port 8788 --behind-proxy
+
+# 3. front with nginx + Let's Encrypt
+sudo cp nginx.example.conf /etc/nginx/sites-available/codex-auth-api
+sudo ln -s /etc/nginx/sites-available/codex-auth-api /etc/nginx/sites-enabled/
+sudo certbot --nginx -d api.example.com
+sudo nginx -t && sudo systemctl reload nginx
+
+# 4. (optional) run under systemd
+sudo cp codex-auth-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-auth-api
+```
+
+### Using a key from a client machine
+
+```bash
+export CODEX_API_BASE=https://api.example.com
+export CODEX_API_KEY=ck_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# one account
+python3 client_fetch.py alice --dest ~/.codex-alice/auth.json
+BROWSER=true CODEX_HOME=~/.codex-alice codex
+
+# every account this key can see
+python3 client_fetch.py --all --root ~/codex-fleet
+BROWSER=true CODEX_HOME=~/codex-fleet/alice codex
+```
+
+### Key management
+
+```bash
+python3 apikey_admin.py list                  # show all keys + use counts
+python3 apikey_admin.py revoke <key_id>       # mark revoked (still in store)
+python3 apikey_admin.py rotate <key_id>       # new value, same scope
+python3 apikey_admin.py delete <key_id>       # remove permanently
+```
+
+A revoked or deleted key returns `401` on the next request and is logged.
+
+### Hardening to consider
+
+- Run the systemd unit as a dedicated `codex` user with only read access to
+  `homes/` and write access to `audit.log` + `api_keys.json` (see
+  `codex-auth-api.service`).
+- Add `fail2ban` rules on repeated `401` lines in `/var/log/nginx/codex-api.log`.
+- Require **mTLS** (`ssl_client_certificate` + `ssl_verify_client on` in
+  nginx) for the highest-sensitivity tier — pin client certs per laptop.
+- Hold `audit.log` on a write-once mount (e.g. a remote syslog sink).
+- Rotate keys periodically (`apikey_admin.py rotate`) — the rotation also
+  resets `use_count` so finite-use semantics still hold.
+- Consider an outbound firewall rule that only permits the host to reach
+  `chatgpt.com` and `auth.openai.com`; the `/status` endpoint needs that,
+  the `/auth` endpoint does not.
 
 The endpoint queried is `GET https://chatgpt.com/backend-api/wham/usage`,
 authenticated with the account's `access_token` and a `chatgpt-account-id`

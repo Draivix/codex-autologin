@@ -4,6 +4,10 @@ homes/
 *.auth.json
 .env
 
+# API key store + audit log
+api_keys.json
+audit.log
+
 # debug artifacts produced by codex_autologin.py --debug
 debug_*.png
 debug_*.html

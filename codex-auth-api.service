@@ -1,0 +1,45 @@
+[Unit]
+Description=codex-autologin auth distribution API
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex
+Group=codex
+WorkingDirectory=/srv/codex-autologin
+# auth_api.py picks up waitress if installed; otherwise falls back to flask dev.
+# pip install flask waitress before enabling this unit.
+ExecStart=/usr/bin/python3 /srv/codex-autologin/auth_api.py \
+    --host 127.0.0.1 --port 8788 --behind-proxy
+
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+# hardening — prevent the API process from doing anything but read homes/
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/codex-autologin/audit.log /srv/codex-autologin/api_keys.json
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @debug @cpu-emulation @obsolete @privileged @raw-io
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# do not let the service speak to the public internet directly
+# (nginx is the only ingress; outbound is needed for /wham/usage status calls)
+# IPAddressAllow=...  # tighten if you do not use the /status endpoint
+
+[Install]
+WantedBy=multi-user.target
