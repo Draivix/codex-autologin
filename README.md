@@ -76,19 +76,22 @@ This repo solves all four with about 500 lines of Python.
 - Linux/macOS. The `BROWSER=true` trick (see "Footguns" below) is
   Linux-specific; the rest is portable.
 
-## Install
+## Install (dev / local workstation)
 
 ```bash
 git clone https://github.com/Draivix/codex-autologin.git
 cd codex-autologin
 
-pip install "camoufox[geoip]"
+pip install "camoufox[geoip]" flask waitress
 python3 -m camoufox fetch           # downloads patched Firefox + GeoIP
 
 cp accounts.example.json accounts.json
 chmod 600 accounts.json
 $EDITOR accounts.json               # fill in real credentials
 ```
+
+Then jump to [Usage](#usage). For a real server deployment see
+[Production deployment](#production-deployment) below.
 
 ## `accounts.json` schema
 
@@ -361,6 +364,226 @@ header. The response includes `plan_type`, `rate_limit.primary_window`
 (5 h rolling), `rate_limit.secondary_window` (7 d rolling),
 `additional_rate_limits` (per model, e.g. the `GPT-5.3-Codex-Spark` /
 `codex_bengalfox` feature) and `credits.balance`.
+
+## Production deployment
+
+End-to-end guide for putting `codex-autologin` on a Linux server with a real
+TLS hostname (here: `codexapi.draivix.com`). The server fetches OTPs from an
+IMAP mailbox you control, holds all `auth.json` files, and serves them to
+authenticated clients over HTTPS.
+
+### 0. Server prerequisites
+
+- Ubuntu 22.04 / 24.04 or Debian 12 (other distros work; commands assume apt).
+- A hostname pointing to the server's IPv4 (and ideally IPv6) — see [DNS
+  setup](#dns-setup) below.
+- Open ports `80/tcp` (Let's Encrypt http-01 challenge) and `443/tcp` (TLS).
+- Server must reach the public internet — Camoufox talks to
+  `auth.openai.com`, OTP polling talks to your IMAP host, and the `/status`
+  endpoint talks to `chatgpt.com/backend-api`.
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip git nginx curl jq \
+                    libgtk-3-0 libxt6 libdbus-glib-1-2 \
+                    fonts-liberation libasound2
+# Camoufox is patched Firefox; the libs above let its headless mode launch
+# even on a server with no Xorg.
+```
+
+### 1. Service user + repo
+
+```bash
+sudo useradd --system --create-home --shell /bin/bash codex
+sudo -u codex git clone https://github.com/Draivix/codex-autologin.git /srv/codex-autologin
+sudo chown -R codex:codex /srv/codex-autologin
+```
+
+### 2. Python deps + Camoufox browser
+
+```bash
+sudo -u codex pip install --user "camoufox[geoip]" flask waitress
+sudo -u codex python3 -m camoufox fetch    # ~120 MB download
+```
+
+### 3. Install the official codex CLI
+
+```bash
+# Node-based release (recommended — same channel OpenAI publishes):
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+sudo apt install -y nodejs
+sudo npm install -g @openai/codex
+codex --version            # should print codex-cli 0.130+ as `codex`
+```
+
+(Standalone Rust binaries also work; just make sure `codex` is on
+`$PATH` for the `codex` user.)
+
+### 4. Configure accounts
+
+```bash
+sudo -u codex cp /srv/codex-autologin/accounts.example.json \
+                 /srv/codex-autologin/accounts.json
+sudo chmod 600 /srv/codex-autologin/accounts.json
+sudo -u codex $EDITOR /srv/codex-autologin/accounts.json
+```
+
+Fill in your real IMAP host and one entry per ChatGPT account. See the
+[`accounts.json` schema](#accountsjson-schema) section above for the field
+reference.
+
+### 5. Mint the first admin API key
+
+```bash
+cd /srv/codex-autologin
+sudo -u codex python3 apikey_admin.py generate --label admin --scope '*'
+```
+
+**The plaintext key is printed exactly once.** Copy it now into your
+password manager — it cannot be recovered, only rotated.
+
+### 6. Bootstrap every account (browser logins)
+
+This is the slow part — each account takes 20–90 s and they run sequentially.
+
+```bash
+sudo -u codex python3 /srv/codex-autologin/codex_autologin.py --all
+```
+
+Verify with the CLI status dump:
+
+```bash
+sudo -u codex python3 /srv/codex-autologin/codex_status.py
+```
+
+You should see one row per account with its plan + 5 h / 7 d windows.
+`homes/<account>/auth.json` is now a 4–5 KB file with the long-lived
+refresh token. Codex refreshes the short-lived access token automatically
+in the background.
+
+### 7. DNS setup
+
+Point your hostname at the server. Example for `codexapi.draivix.com` →
+`225.davidstrejc.cz` (`94.130.15.46` + `2a01:4f8:10b:1353::2`):
+
+```text
+codexapi.draivix.com.   3600   IN  A     94.130.15.46
+codexapi.draivix.com.   3600   IN  AAAA  2a01:4f8:10b:1353::2
+```
+
+Wait until both records resolve:
+
+```bash
+dig +short codexapi.draivix.com A
+dig +short codexapi.draivix.com AAAA
+```
+
+### 8. nginx + Let's Encrypt
+
+```bash
+sudo cp /srv/codex-autologin/nginx.example.conf \
+        /etc/nginx/sites-available/codex-auth-api
+sudo $EDITOR /etc/nginx/sites-available/codex-auth-api
+#   ^ replace `api.example.com` with `codexapi.draivix.com`
+sudo ln -s /etc/nginx/sites-available/codex-auth-api \
+           /etc/nginx/sites-enabled/codex-auth-api
+sudo nginx -t
+
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d codexapi.draivix.com \
+             --redirect --no-eff-email --agree-tos -m you@example.com
+# certbot rewrites the server { listen 443 } block with real cert paths
+# and sets up auto-renewal under systemd (certbot.timer).
+
+sudo systemctl reload nginx
+```
+
+### 9. systemd unit for the API
+
+```bash
+sudo cp /srv/codex-autologin/codex-auth-api.service \
+        /etc/systemd/system/codex-auth-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-auth-api
+sudo systemctl status codex-auth-api --no-pager
+```
+
+The unit:
+- runs as the unprivileged `codex` user;
+- binds only on `127.0.0.1:8788` (nginx is the only ingress);
+- uses `NoNewPrivileges`, `ProtectSystem=strict`, `MemoryDenyWriteExecute`,
+  a syscall allow-list, and `CapabilityBoundingSet=` (no caps).
+
+### 10. Smoke test from your laptop
+
+```bash
+export CODEX_API_BASE=https://codexapi.draivix.com
+export CODEX_API_KEY=ck_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+curl -s "$CODEX_API_BASE/v1/health"
+# {"status":"ok"}
+
+curl -s -H "Authorization: Bearer $CODEX_API_KEY" \
+        "$CODEX_API_BASE/v1/accounts" | jq
+# {"accounts": ["alice", "bob", ...]}
+
+python3 client_fetch.py alice --dest ~/.codex-alice/auth.json
+BROWSER=true CODEX_HOME=~/.codex-alice codex login status
+# Logged in using ChatGPT
+```
+
+### 11. Day-2 operations
+
+```bash
+# rotate / mint per-developer keys
+sudo -u codex python3 apikey_admin.py generate \
+     --label "dev1 - alice@example.com" --scope alice,carol \
+     --rate-limit 20 --ip-allowlist 10.0.0.0/8
+
+# trigger a re-login via the API (admin key required)
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" \
+     https://codexapi.draivix.com/v1/accounts/alice/reconnect
+
+# poll the live progress
+curl -H "Authorization: Bearer $ADMIN_KEY" \
+     https://codexapi.draivix.com/v1/accounts/alice/reconnect-status | jq
+
+# inspect audit log
+sudo tail -f /srv/codex-autologin/audit.log | jq -c
+
+# view systemd / nginx logs
+sudo journalctl -u codex-auth-api -f
+sudo tail -f /var/log/nginx/codex-api.log
+```
+
+### Where things live on disk
+
+```text
+/srv/codex-autologin/                   # repo (codex user)
+    accounts.json                       # mode 600, IMAP + per-account creds
+    api_keys.json                       # mode 600, SHA-256 hashes only
+    audit.log                           # append-only JSONL
+    homes/<account>/auth.json           # codex's auth files (mode 600)
+    reconnect_logs/<account>-<ts>.log   # autologin output per reconnect
+
+/etc/nginx/sites-enabled/codex-auth-api # TLS, security headers, rate limit
+/etc/letsencrypt/live/codexapi.draivix.com/{fullchain,privkey}.pem
+/etc/systemd/system/codex-auth-api.service
+```
+
+### Hardening checklist
+
+- [ ] Run the systemd unit as a dedicated unprivileged user (`codex`).
+- [ ] `chmod 600` on `accounts.json`, `api_keys.json`; owned by `codex`.
+- [ ] Per-developer API keys with narrow `scope`, not one shared master key.
+- [ ] Restrict the admin key to a single trusted IP via `ip_allowlist`.
+- [ ] `fail2ban` on repeated 401 lines in `/var/log/nginx/codex-api.log`.
+- [ ] Optional: require **mTLS** for the highest-sensitivity tier
+      (`ssl_client_certificate` + `ssl_verify_client on` in nginx).
+- [ ] Ship `audit.log` to a write-once sink (syslog → loki/papertrail).
+- [ ] Rotate every key on a schedule (`apikey_admin.py rotate <key_id>`).
+- [ ] Outbound egress firewall: only allow `auth.openai.com`,
+      `chatgpt.com`, and your IMAP host from the `codex` user.
 
 ## How multi-account works under the hood
 
