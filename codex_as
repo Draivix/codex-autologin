@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run codex with a specific account's CODEX_HOME.
+# Usage:
+#   ./codex_as alice                  # interactive codex with alice account
+#   ./codex_as alice exec "do thing"  # one-shot
+#   ./codex_as alice login status     # check login
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <account-key> [codex-args ...]" >&2
+  echo "available accounts:" >&2
+  ls "$(dirname "$0")/homes" 2>/dev/null | sed 's/^/  /' >&2 || true
+  exit 2
+fi
+
+ACCOUNT="$1"; shift
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+HOME_DIR="$ROOT/homes/$ACCOUNT"
+
+if [[ ! -d "$HOME_DIR" ]]; then
+  echo "error: no codex home for '$ACCOUNT' at $HOME_DIR" >&2
+  echo "first log in:  python3 $ROOT/codex_autologin.py $ACCOUNT" >&2
+  exit 3
+fi
+
+# BROWSER=true so any login re-prompt does not hijack the real browser.
+exec env BROWSER=true CODEX_HOME="$HOME_DIR" codex "$@"

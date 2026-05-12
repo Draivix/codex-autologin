@@ -1,0 +1,20 @@
+{
+  "_comment_": "Copy this to accounts.json and chmod 600. NEVER commit accounts.json.",
+  "imap": {
+    "host": "mail.example.com",
+    "port": 993,
+    "ssl": true
+  },
+  "accounts": {
+    "alice": {
+      "email": "alice@example.com",
+      "password": "REPLACE_WITH_OPENAI_PASSWORD",
+      "imap_user": "alice@example.com",
+      "imap_password": "REPLACE_WITH_IMAP_PASSWORD_OR_OMIT_TO_REUSE_PASSWORD"
+    },
+    "bob": {
+      "email": "bob@example.com",
+      "password": "REPLACE_WITH_OPENAI_PASSWORD"
+    }
+  }
+}
