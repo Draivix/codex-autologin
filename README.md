@@ -261,13 +261,31 @@ clients over HTTPS.
 
 ### Endpoints
 
-| Method | Path | Auth | Description |
-| ------ | ---- | ---- | ----------- |
-| `GET`  | `/v1/health` | none | liveness probe |
-| `GET`  | `/v1/accounts` | bearer | list accounts the key can access |
-| `GET`  | `/v1/accounts/<name>/status` | bearer | live `/wham/usage` for that account |
-| `GET`  | `/v1/accounts/<name>/auth` | bearer | **the auth.json** (secret) |
-| `POST` | `/v1/accounts/<name>/refresh` | admin | trigger `codex_autologin.py --force` |
+| Method   | Path                                       | Auth   | Description |
+| -------- | ------------------------------------------ | ------ | ----------- |
+| `GET`    | `/v1/health`                               | none   | liveness probe |
+| `GET`    | `/v1/accounts`                             | bearer | list accounts the key can access |
+| `GET`    | `/v1/accounts/<name>`                      | bearer | account metadata (no secrets) — file presence, size, plan, JWT email, in-config flag |
+| `POST`   | `/v1/accounts`                             | admin  | create an account in `accounts.json` (body: `name`, `email`, `password`, optional `imap_user` / `imap_password`, optional `login:true` to immediately start the browser flow) |
+| `PATCH`  | `/v1/accounts/<name>`                      | admin  | update fields on an existing account (any of `email`, `password`, `imap_user`, `imap_password`) |
+| `DELETE` | `/v1/accounts/<name>`                      | admin  | remove from `accounts.json` AND `rm -rf homes/<name>` |
+| `GET`    | `/v1/accounts/<name>/status`               | bearer | live `/wham/usage` for that account |
+| `GET`    | `/v1/accounts/<name>/auth`                 | bearer | **the auth.json** (the actual secret) |
+| `DELETE` | `/v1/accounts/<name>/auth`                 | admin  | local "logout" — delete the auth.json file only |
+| `POST`   | `/v1/accounts/<name>/reconnect`            | admin  | spawn `codex_autologin.py --force` in the background |
+| `POST`   | `/v1/accounts/<name>/refresh`              | admin  | alias for `/reconnect` (kept for compatibility) |
+| `GET`    | `/v1/accounts/<name>/reconnect-status`     | admin  | poll `idle` / `running` / `ok` / `failed` plus a 20-line tail of the autologin log |
+| `GET`    | `/v1/keys`                                 | admin  | list every API key (label, scope, rate limit, use count, revoked flag — never the plaintext) |
+| `POST`   | `/v1/keys`                                 | admin  | mint a new key. **Plaintext returned exactly once.** Body: `label`, `scope` (list, `["*"]` for admin), optional `rate_limit`, `ip_allowlist`, `max_uses` |
+| `GET`    | `/v1/keys/<key_id>`                        | admin  | metadata for one key (still no plaintext) |
+| `PATCH`  | `/v1/keys/<key_id>`                        | admin  | update `label` / `scope` / `rate_limit` / `ip_allowlist` / `max_uses` / `revoked` |
+| `DELETE` | `/v1/keys/<key_id>`                        | admin  | delete a key permanently (the API refuses to delete the key currently being used to authenticate the call) |
+| `GET`    | `/v1/imap`                                 | admin  | read the IMAP config currently in use |
+| `PUT`    | `/v1/imap`                                 | admin  | overwrite the IMAP config (`host`, `port`, `ssl`) |
+| `GET`    | `/v1/audit?limit=N`                        | admin  | tail the audit log (default 100, max 1000 entries) as JSON |
+
+"admin" means the bearer key's `scope` is `["*"]`. Every admin call is
+recorded in `audit.log` with the calling `key_id`.
 
 ### Setup on the central server
 

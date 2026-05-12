@@ -32,31 +32,49 @@ Security model
 
 Endpoints
 ---------
-GET  /v1/health                       — public liveness probe (no auth)
-GET  /v1/accounts                     — list accounts your key can access
-GET  /v1/accounts/<name>/status       — usage info (less sensitive)
-GET  /v1/accounts/<name>/auth         — return the auth.json (the secret!)
-POST /v1/accounts/<name>/refresh      — trigger re-login (admin scope only)
+GET    /v1/health                                — public liveness probe
+GET    /v1/accounts                              — list accounts key can access
+GET    /v1/accounts/<name>                       — account metadata (no secrets)
+POST   /v1/accounts                              — create account (admin)
+PATCH  /v1/accounts/<name>                       — update creds (admin)
+DELETE /v1/accounts/<name>                       — remove account + homes/<n>/ (admin)
+GET    /v1/accounts/<name>/status                — live /wham/usage data
+GET    /v1/accounts/<name>/auth                  — return auth.json (the secret)
+DELETE /v1/accounts/<name>/auth                  — local logout: drop auth.json (admin)
+POST   /v1/accounts/<name>/reconnect             — re-login in background (admin)
+POST   /v1/accounts/<name>/refresh               — alias for /reconnect
+GET    /v1/accounts/<name>/reconnect-status      — running/ok/failed + log tail
+GET    /v1/keys                                  — list keys (admin)
+POST   /v1/keys                                  — mint a new key (admin)
+GET    /v1/keys/<key_id>                         — key metadata (admin)
+PATCH  /v1/keys/<key_id>                         — update scope/limits/revoke (admin)
+DELETE /v1/keys/<key_id>                         — delete a key (admin)
+GET    /v1/imap                                  — current IMAP config (admin)
+PUT    /v1/imap                                  — update IMAP host/port/ssl (admin)
+GET    /v1/audit?limit=N                         — tail audit log (admin)
 
 Usage
 -----
-    pip install flask
-    # 1. mint keys
-    python3 apikey_admin.py generate --label dev1 --scope alice,carol
-    # 2. run server
+    pip install flask waitress
+    # 1. mint the first admin key (only CLI can do this when no key exists)
+    python3 apikey_admin.py generate --label admin --scope '*'
+    # 2. run server (waitress in production)
     python3 auth_api.py --port 8788 --behind-proxy
-    # 3. front with nginx (see nginx.example.conf)
+    # 3. front with nginx + Let's Encrypt (see nginx.example.conf)
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import ipaddress
 import json
 import os
+import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -73,14 +91,17 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 HOMES = ROOT / "homes"
 KEYS_FILE = ROOT / "api_keys.json"
+ACCOUNTS_FILE = ROOT / "accounts.json"
 AUDIT_LOG = ROOT / "audit.log"
-MAX_BODY_BYTES = 64 * 1024  # 64 KiB cap on incoming bodies
-DEFAULT_RATE_LIMIT = 30      # requests per minute per key
+MAX_BODY_BYTES = 64 * 1024
+DEFAULT_RATE_LIMIT = 30
 KEY_PREFIX = "ck_live_"
+ACCOUNT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ---------------- Key store ----------------
-_keys_lock = threading.Lock()
+_keys_lock = threading.RLock()
 _keys_cache: dict | None = None
 _keys_mtime: float = 0.0
 
@@ -266,6 +287,143 @@ def list_accessible(meta: dict) -> list[str]:
     return [a for a in available if a in scope]
 
 
+def is_admin(meta: dict) -> bool:
+    return "*" in (meta.get("scope") or [])
+
+
+# ---------------- accounts.json store ----------------
+_accounts_lock = threading.RLock()
+
+
+def load_accounts() -> dict:
+    if not ACCOUNTS_FILE.exists():
+        return {"imap": {"host": "", "port": 993, "ssl": True}, "accounts": {}}
+    with ACCOUNTS_FILE.open() as f:
+        return json.load(f)
+
+
+def save_accounts(data: dict) -> None:
+    tmp = ACCOUNTS_FILE.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    tmp.replace(ACCOUNTS_FILE)
+
+
+def safe_account_name(name: str) -> bool:
+    return bool(ACCOUNT_NAME_RE.match(name)) and ".." not in name and "/" not in name
+
+
+def _decode_jwt_payload(jwt: str) -> dict | None:
+    try:
+        parts = jwt.split(".")
+        if len(parts) < 2:
+            return None
+        pad = "=" * (-len(parts[1]) % 4)
+        raw = base64.urlsafe_b64decode(parts[1] + pad)
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def account_status_meta(name: str) -> dict:
+    """Non-secret metadata for an account: file presence/size + JWT email + plan."""
+    home = HOMES / name
+    auth = home / "auth.json"
+    out = {
+        "name": name,
+        "has_auth": auth.exists(),
+        "auth_size": auth.stat().st_size if auth.exists() else 0,
+    }
+    if auth.exists():
+        try:
+            d = json.loads(auth.read_text())
+            out["last_refresh"] = d.get("last_refresh")
+            id_token = d.get("tokens", {}).get("id_token")
+            if isinstance(id_token, str):
+                claims = _decode_jwt_payload(id_token) or {}
+                out["email"] = claims.get("email")
+                auth_block = claims.get("https://api.openai.com/auth", {})
+                if isinstance(auth_block, dict):
+                    out["plan_type"] = auth_block.get("chatgpt_plan_type")
+        except Exception:
+            pass
+    return out
+
+
+# ---------------- Reconnect (refresh) tracking ----------------
+_reconnect_lock = threading.Lock()
+_reconnect_state: dict[str, dict] = {}
+# {account: {pid, started_at, finished_at|None, exit_code|None, log_path}}
+
+
+def _wait_proc(account: str, proc: subprocess.Popen, log_path: Path) -> None:
+    """Background thread: wait on the autologin subprocess and record outcome."""
+    rc = proc.wait()
+    with _reconnect_lock:
+        st = _reconnect_state.get(account)
+        if st is not None:
+            st["finished_at"] = datetime.now(timezone.utc).isoformat()
+            st["exit_code"] = rc
+
+
+def spawn_reconnect(account: str) -> tuple[bool, str]:
+    """Spawn the autologin in the background for `account`. Returns (ok, message)."""
+    script = ROOT / "codex_autologin.py"
+    if not script.exists():
+        return False, "autologin script missing"
+    with _reconnect_lock:
+        cur = _reconnect_state.get(account)
+        if cur and cur.get("finished_at") is None:
+            return False, "reconnect already in progress"
+    log_dir = ROOT / "reconnect_logs"
+    log_dir.mkdir(exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = log_dir / f"{account}-{ts}.log"
+    try:
+        f = log_path.open("a")
+        proc = subprocess.Popen(
+            [sys.executable, str(script), account, "--force"],
+            cwd=str(ROOT),
+            stdout=f, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return False, f"spawn failed: {e}"
+    with _reconnect_lock:
+        _reconnect_state[account] = {
+            "pid": proc.pid,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "exit_code": None,
+            "log_path": str(log_path),
+        }
+    threading.Thread(target=_wait_proc, args=(account, proc, log_path),
+                     daemon=True).start()
+    return True, "started"
+
+
+def reconnect_status(account: str) -> dict:
+    with _reconnect_lock:
+        st = _reconnect_state.get(account)
+        if not st:
+            return {"state": "idle"}
+        out = dict(st)
+        if out.get("finished_at") is None:
+            out["state"] = "running"
+        else:
+            out["state"] = "ok" if out.get("exit_code") == 0 else "failed"
+    # tail the log if present
+    lp = Path(out.get("log_path", ""))
+    if lp.exists():
+        try:
+            tail = lp.read_text(errors="ignore").splitlines()[-20:]
+            out["log_tail"] = tail
+        except Exception:
+            pass
+    return out
+
+
 # ---------------- App ----------------
 def build_app(behind_proxy: bool) -> Flask:
     app = Flask(__name__)
@@ -330,31 +488,429 @@ def build_app(behind_proxy: bool) -> Flask:
         # Return as JSON content-type; do not log body
         return secure_headers(Response(body, mimetype="application/json"))
 
-    @app.route("/v1/accounts/<account>/refresh", methods=["POST"])
-    def account_refresh(account: str):
+    # -------- account CRUD (admin scope) --------
+    @app.route("/v1/accounts/<account>", methods=["GET"])
+    def account_get(account: str):
         ip = client_ip(behind_proxy)
-        res = authenticate("refresh", account, behind_proxy)
+        res = authenticate("get_account", account, behind_proxy)
         if res[0] is None:
             return res[1]
         key_id, meta = res[0]
-        if "*" not in (meta.get("scope") or []):
-            return deny("refresh", account, key_id, 403, ip, "admin scope required")
-        # spawn re-login in background, do not block the request
-        script = ROOT / "codex_autologin.py"
-        if not script.exists():
-            return deny("refresh", account, key_id, 500, ip, "autologin script missing")
+        if not safe_account_name(account):
+            return deny("get_account", account, key_id, 400, ip, "bad name")
+        if not scope_allows(meta, account):
+            return deny("get_account", account, key_id, 404, ip, "not found")
+        with _accounts_lock:
+            acc = load_accounts().get("accounts", {}).get(account)
+        if not acc:
+            # The account dir may exist (homes/) but no creds — still return file status
+            home_meta = account_status_meta(account)
+            if not home_meta["has_auth"]:
+                return deny("get_account", account, key_id, 404, ip, "not found")
+            audit("get_account", account, key_id, 200, ip)
+            return secure_headers(jsonify(in_config=False, **home_meta))
+        # Strip secrets — never return passwords through the API.
+        # Use config_email vs jwt_email to keep them distinct in the response.
+        meta_info = account_status_meta(account)
+        meta_info["jwt_email"] = meta_info.pop("email", None)
+        cleaned = {"config_email": acc.get("email"),
+                   "has_imap_user_override": "imap_user" in acc,
+                   "has_imap_password_override": "imap_password" in acc}
+        audit("get_account", account, key_id, 200, ip)
+        return secure_headers(jsonify(in_config=True, **cleaned, **meta_info))
+
+    @app.route("/v1/accounts", methods=["POST"])
+    def account_create():
+        ip = client_ip(behind_proxy)
+        res = authenticate("create_account", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("create_account", None, key_id, 403, ip, "admin scope required")
+        body = request.get_json(silent=True) or {}
+        name = (body.get("name") or "").strip()
+        email_addr = (body.get("email") or "").strip()
+        password = body.get("password") or ""
+        imap_user = body.get("imap_user")
+        imap_password = body.get("imap_password")
+        do_login = bool(body.get("login"))
+
+        if not safe_account_name(name):
+            return deny("create_account", name, key_id, 400, ip, "bad name")
+        if not EMAIL_RE.match(email_addr):
+            return deny("create_account", name, key_id, 400, ip, "bad email")
+        if not isinstance(password, str) or len(password) < 4:
+            return deny("create_account", name, key_id, 400, ip, "password too short")
+
+        with _accounts_lock:
+            data = load_accounts()
+            accounts = data.setdefault("accounts", {})
+            if name in accounts:
+                return deny("create_account", name, key_id, 409, ip, "account exists")
+            entry = {"email": email_addr, "password": password}
+            if isinstance(imap_user, str) and imap_user:
+                entry["imap_user"] = imap_user
+            if isinstance(imap_password, str) and imap_password:
+                entry["imap_password"] = imap_password
+            accounts[name] = entry
+            save_accounts(data)
+        audit("create_account", name, key_id, 201, ip,
+              {"email": email_addr, "login_requested": do_login})
+        out = {"name": name, "email": email_addr, "in_config": True, "has_auth": False}
+        if do_login:
+            ok, msg = spawn_reconnect(name)
+            out["login_spawn"] = msg
+            if not ok:
+                out["login_error"] = True
+        return secure_headers(jsonify(out)), 201
+
+    @app.route("/v1/accounts/<account>", methods=["PATCH"])
+    def account_update(account: str):
+        ip = client_ip(behind_proxy)
+        res = authenticate("update_account", account, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("update_account", account, key_id, 403, ip, "admin scope required")
+        if not safe_account_name(account):
+            return deny("update_account", account, key_id, 400, ip, "bad name")
+        body = request.get_json(silent=True) or {}
+        with _accounts_lock:
+            data = load_accounts()
+            acc = data.get("accounts", {}).get(account)
+            if not acc:
+                return deny("update_account", account, key_id, 404, ip, "not found")
+            allowed = ("email", "password", "imap_user", "imap_password")
+            changed = []
+            for k in allowed:
+                if k in body and body[k] is not None:
+                    if k == "email" and not EMAIL_RE.match(body[k]):
+                        return deny("update_account", account, key_id, 400, ip,
+                                    f"bad {k}")
+                    if k in ("password", "imap_password") and \
+                       (not isinstance(body[k], str) or len(body[k]) < 4):
+                        return deny("update_account", account, key_id, 400, ip,
+                                    f"bad {k}")
+                    acc[k] = body[k]
+                    changed.append(k)
+            if not changed:
+                return deny("update_account", account, key_id, 400, ip,
+                            "no updatable fields")
+            save_accounts(data)
+        audit("update_account", account, key_id, 200, ip, {"fields": changed})
+        return secure_headers(jsonify(name=account, updated=changed))
+
+    @app.route("/v1/accounts/<account>", methods=["DELETE"])
+    def account_delete(account: str):
+        ip = client_ip(behind_proxy)
+        res = authenticate("delete_account", account, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("delete_account", account, key_id, 403, ip, "admin scope required")
+        if not safe_account_name(account):
+            return deny("delete_account", account, key_id, 400, ip, "bad name")
+        removed_config = False
+        removed_home = False
+        with _accounts_lock:
+            data = load_accounts()
+            if account in data.get("accounts", {}):
+                del data["accounts"][account]
+                save_accounts(data)
+                removed_config = True
+        home = HOMES / account
+        if home.is_dir():
+            shutil.rmtree(home, ignore_errors=True)
+            removed_home = True
+        if not removed_config and not removed_home:
+            return deny("delete_account", account, key_id, 404, ip, "not found")
+        audit("delete_account", account, key_id, 200, ip,
+              {"removed_config": removed_config, "removed_home": removed_home})
+        return secure_headers(jsonify(name=account,
+                                      removed_config=removed_config,
+                                      removed_home=removed_home))
+
+    @app.route("/v1/accounts/<account>/auth", methods=["DELETE"])
+    def account_logout(account: str):
+        """Drop the local auth.json (codex sees this account as logged out)."""
+        ip = client_ip(behind_proxy)
+        res = authenticate("logout", account, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("logout", account, key_id, 403, ip, "admin scope required")
+        if not safe_account_name(account):
+            return deny("logout", account, key_id, 400, ip, "bad name")
+        auth_path = HOMES / account / "auth.json"
+        if not auth_path.exists():
+            return deny("logout", account, key_id, 404, ip, "no auth.json")
         try:
-            subprocess.Popen(
-                [sys.executable, str(script), account, "--force"],
-                cwd=str(ROOT),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            auth_path.unlink()
         except Exception as e:
-            return deny("refresh", account, key_id, 500, ip, f"spawn: {e}")
-        audit("refresh", account, key_id, 202, ip)
-        return secure_headers(jsonify(status="started"))
+            return deny("logout", account, key_id, 500, ip, f"unlink: {e}")
+        audit("logout", account, key_id, 200, ip)
+        return secure_headers(jsonify(name=account, removed=True))
+
+    @app.route("/v1/accounts/<account>/reconnect", methods=["POST"])
+    @app.route("/v1/accounts/<account>/refresh", methods=["POST"])
+    def account_reconnect(account: str):
+        ip = client_ip(behind_proxy)
+        res = authenticate("reconnect", account, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("reconnect", account, key_id, 403, ip, "admin scope required")
+        if not safe_account_name(account):
+            return deny("reconnect", account, key_id, 400, ip, "bad name")
+        with _accounts_lock:
+            acc = load_accounts().get("accounts", {}).get(account)
+        if not acc:
+            return deny("reconnect", account, key_id, 404, ip, "no creds in accounts.json")
+        ok, msg = spawn_reconnect(account)
+        if not ok:
+            return deny("reconnect", account, key_id, 409, ip, msg)
+        audit("reconnect", account, key_id, 202, ip)
+        return secure_headers(jsonify(status="started", message=msg)), 202
+
+    @app.route("/v1/accounts/<account>/reconnect-status", methods=["GET"])
+    def account_reconnect_status(account: str):
+        ip = client_ip(behind_proxy)
+        res = authenticate("reconnect_status", account, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("reconnect_status", account, key_id, 403, ip, "admin scope required")
+        if not safe_account_name(account):
+            return deny("reconnect_status", account, key_id, 400, ip, "bad name")
+        st = reconnect_status(account)
+        audit("reconnect_status", account, key_id, 200, ip, {"state": st.get("state")})
+        return secure_headers(jsonify(st))
+
+    # -------- API key CRUD (admin only) --------
+    @app.route("/v1/keys", methods=["GET"])
+    def keys_list():
+        ip = client_ip(behind_proxy)
+        res = authenticate("keys_list", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("keys_list", None, key_id, 403, ip, "admin scope required")
+        data = _load_keys()
+        out = []
+        for kid, m in (data.get("keys") or {}).items():
+            out.append({
+                "key_id": kid,
+                "label": m.get("label"),
+                "scope": m.get("scope"),
+                "rate_limit": m.get("rate_limit"),
+                "ip_allowlist": m.get("ip_allowlist"),
+                "max_uses": m.get("max_uses"),
+                "use_count": m.get("use_count", 0),
+                "last_used_at": m.get("last_used_at"),
+                "created_at": m.get("created_at"),
+                "revoked": bool(m.get("revoked")),
+            })
+        audit("keys_list", None, key_id, 200, ip, {"count": len(out)})
+        return secure_headers(jsonify(keys=out))
+
+    @app.route("/v1/keys", methods=["POST"])
+    def keys_create():
+        ip = client_ip(behind_proxy)
+        res = authenticate("keys_create", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("keys_create", None, key_id, 403, ip, "admin scope required")
+        body = request.get_json(silent=True) or {}
+        label = (body.get("label") or "").strip()
+        scope = body.get("scope") or []
+        rate_limit = int(body.get("rate_limit") or DEFAULT_RATE_LIMIT)
+        ip_allowlist = body.get("ip_allowlist") or []
+        max_uses = body.get("max_uses")
+        if not label or len(label) > 64:
+            return deny("keys_create", None, key_id, 400, ip, "bad label")
+        if not isinstance(scope, list) or not scope:
+            return deny("keys_create", None, key_id, 400, ip, "scope must be non-empty list")
+        for s in scope:
+            if s != "*" and not safe_account_name(s):
+                return deny("keys_create", None, key_id, 400, ip, f"bad scope item: {s}")
+        # mint
+        raw = secrets.token_urlsafe(32)
+        plaintext = f"{KEY_PREFIX}{raw}"
+        h = hashlib.sha256(plaintext.encode()).hexdigest()
+        new_id = "key_" + secrets.token_hex(6)
+        entry = {
+            "label": label,
+            "hash": h,
+            "scope": scope,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "rate_limit": rate_limit,
+            "ip_allowlist": [c for c in ip_allowlist if isinstance(c, str)],
+            "max_uses": max_uses if isinstance(max_uses, int) else None,
+            "use_count": 0,
+            "last_used_at": None,
+            "revoked": False,
+        }
+        with _keys_lock:
+            data = _load_keys()
+            data.setdefault("keys", {})[new_id] = entry
+            _save_keys(data)
+        audit("keys_create", None, key_id, 201, ip,
+              {"new_key_id": new_id, "scope": scope})
+        return secure_headers(jsonify(key_id=new_id, plaintext=plaintext,
+                                      label=label, scope=scope,
+                                      warning="plaintext is shown only here; store it now")), 201
+
+    @app.route("/v1/keys/<kid>", methods=["GET"])
+    def keys_get(kid: str):
+        ip = client_ip(behind_proxy)
+        res = authenticate("keys_get", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("keys_get", None, key_id, 403, ip, "admin scope required")
+        data = _load_keys()
+        m = (data.get("keys") or {}).get(kid)
+        if not m:
+            return deny("keys_get", None, key_id, 404, ip, "not found")
+        out = {k: v for k, v in m.items() if k != "hash"}
+        out["key_id"] = kid
+        audit("keys_get", None, key_id, 200, ip, {"target": kid})
+        return secure_headers(jsonify(out))
+
+    @app.route("/v1/keys/<kid>", methods=["PATCH"])
+    def keys_update(kid: str):
+        ip = client_ip(behind_proxy)
+        res = authenticate("keys_update", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("keys_update", None, key_id, 403, ip, "admin scope required")
+        body = request.get_json(silent=True) or {}
+        with _keys_lock:
+            data = _load_keys()
+            m = (data.get("keys") or {}).get(kid)
+            if not m:
+                return deny("keys_update", None, key_id, 404, ip, "not found")
+            changed = []
+            if "label" in body and isinstance(body["label"], str):
+                m["label"] = body["label"][:64]; changed.append("label")
+            if "scope" in body and isinstance(body["scope"], list):
+                for s in body["scope"]:
+                    if s != "*" and not safe_account_name(s):
+                        return deny("keys_update", None, key_id, 400, ip,
+                                    f"bad scope item: {s}")
+                m["scope"] = body["scope"]; changed.append("scope")
+            if "rate_limit" in body and isinstance(body["rate_limit"], int):
+                m["rate_limit"] = max(1, body["rate_limit"]); changed.append("rate_limit")
+            if "ip_allowlist" in body and isinstance(body["ip_allowlist"], list):
+                m["ip_allowlist"] = [c for c in body["ip_allowlist"] if isinstance(c, str)]
+                changed.append("ip_allowlist")
+            if "max_uses" in body:
+                v = body["max_uses"]
+                m["max_uses"] = v if isinstance(v, int) else None
+                changed.append("max_uses")
+            if "revoked" in body and isinstance(body["revoked"], bool):
+                m["revoked"] = body["revoked"]; changed.append("revoked")
+            if not changed:
+                return deny("keys_update", None, key_id, 400, ip,
+                            "no updatable fields")
+            _save_keys(data)
+        audit("keys_update", None, key_id, 200, ip, {"target": kid, "fields": changed})
+        return secure_headers(jsonify(key_id=kid, updated=changed))
+
+    @app.route("/v1/keys/<kid>", methods=["DELETE"])
+    def keys_delete(kid: str):
+        ip = client_ip(behind_proxy)
+        res = authenticate("keys_delete", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("keys_delete", None, key_id, 403, ip, "admin scope required")
+        if kid == key_id:
+            return deny("keys_delete", None, key_id, 400, ip,
+                        "refusing to delete the key making this request")
+        with _keys_lock:
+            data = _load_keys()
+            if kid not in (data.get("keys") or {}):
+                return deny("keys_delete", None, key_id, 404, ip, "not found")
+            del data["keys"][kid]
+            _save_keys(data)
+        audit("keys_delete", None, key_id, 200, ip, {"target": kid})
+        return secure_headers(jsonify(key_id=kid, deleted=True))
+
+    # -------- IMAP config --------
+    @app.route("/v1/imap", methods=["GET"])
+    def imap_get():
+        ip = client_ip(behind_proxy)
+        res = authenticate("imap_get", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("imap_get", None, key_id, 403, ip, "admin scope required")
+        with _accounts_lock:
+            cfg = load_accounts().get("imap", {})
+        audit("imap_get", None, key_id, 200, ip)
+        return secure_headers(jsonify(cfg))
+
+    @app.route("/v1/imap", methods=["PUT"])
+    def imap_put():
+        ip = client_ip(behind_proxy)
+        res = authenticate("imap_put", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("imap_put", None, key_id, 403, ip, "admin scope required")
+        body = request.get_json(silent=True) or {}
+        host = body.get("host")
+        port = body.get("port", 993)
+        ssl_flag = body.get("ssl", True)
+        if not isinstance(host, str) or not host:
+            return deny("imap_put", None, key_id, 400, ip, "host required")
+        if not isinstance(port, int) or port <= 0 or port > 65535:
+            return deny("imap_put", None, key_id, 400, ip, "bad port")
+        with _accounts_lock:
+            data = load_accounts()
+            data["imap"] = {"host": host, "port": port, "ssl": bool(ssl_flag)}
+            save_accounts(data)
+        audit("imap_put", None, key_id, 200, ip, {"host": host, "port": port})
+        return secure_headers(jsonify(data["imap"]))
+
+    # -------- Audit log tail --------
+    @app.route("/v1/audit", methods=["GET"])
+    def audit_tail():
+        ip = client_ip(behind_proxy)
+        res = authenticate("audit", None, behind_proxy)
+        if res[0] is None:
+            return res[1]
+        key_id, meta = res[0]
+        if not is_admin(meta):
+            return deny("audit", None, key_id, 403, ip, "admin scope required")
+        limit = max(1, min(int(request.args.get("limit", 100)), 1000))
+        if not AUDIT_LOG.exists():
+            return secure_headers(jsonify(entries=[]))
+        lines = AUDIT_LOG.read_text(errors="ignore").splitlines()[-limit:]
+        out = []
+        for ln in lines:
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                pass
+        audit("audit", None, key_id, 200, ip, {"returned": len(out)})
+        return secure_headers(jsonify(entries=out))
 
     @app.errorhandler(404)
     def _404(_):
