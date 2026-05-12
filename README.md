@@ -54,7 +54,8 @@ This repo solves all four with about 500 lines of Python.
 | File | Purpose |
 | ---- | ------- |
 | `codex_autologin.py` | The autologin. Spawns `codex login`, drives `auth.openai.com` with Camoufox, fetches the OTP via IMAP, lets codex write `auth.json`. |
-| `codex_status.py` | Calls `/backend-api/wham/usage` for every logged-in account; prints plan + 5h/7d rate-limit windows + credits. |
+| `codex_status.py` | CLI: calls `/backend-api/wham/usage` for every logged-in account; prints plan + 5h/7d rate-limit windows + credits as a table. |
+| `status_ui.py` | Flask web dashboard for the same data. Auto-refreshing color-coded bars, served at `http://127.0.0.1:8765`. |
 | `codex_as` | Tiny shell wrapper: `./codex_as <account> [codex args]` runs codex with the right `CODEX_HOME` and `BROWSER=true`. |
 | `accounts.example.json` | Template — copy to `accounts.json`, chmod 600, fill in real values. |
 | `homes/<account>/auth.json` | Per-account state, created by codex itself. **Never** committed. |
@@ -152,13 +153,32 @@ when it has to be resent.
 ### Log into all accounts in one go
 
 ```bash
-for a in $(jq -r '.accounts | keys[]' accounts.json); do
-  python3 codex_autologin.py "$a" || echo "$a FAILED"
-done
+python3 codex_autologin.py --all                # bootstrap everything
+python3 codex_autologin.py --all --cooldown 60  # gentler between accounts
+python3 codex_autologin.py --all --force        # ignore existing auth.json
 ```
 
-Run sequentially, not in parallel — they would collide on port 1455
-(codex's local OAuth callback server).
+`--all` iterates every entry in `accounts.json` sequentially. Accounts that
+already pass `codex login status` are skipped unless you pass `--force`.
+Between accounts the script sleeps `--cooldown` seconds (default 30) so
+OpenAI does not flag seven consecutive logins from one IP as suspicious.
+
+A summary is printed at the end:
+
+```
+========== SUMMARY ==========
+  alice          ok
+  bob            skipped
+  carol          ok
+  dan            failed
+4/4 accounts ready
+```
+
+Exit status is 0 only if every account is `ok` or `skipped`.
+
+Login flows run sequentially because codex's local OAuth callback server
+binds a fixed port (1455). After bootstrap, *using* the accounts in
+parallel is fine — see "How multi-account works".
 
 ### Use a specific account
 
@@ -188,6 +208,25 @@ For machine-readable output:
 python3 codex_status.py --json | jq '.alice.rate_limit'
 python3 codex_status.py --json | jq '.alice.additional_rate_limits'
 ```
+
+### Web dashboard
+
+For a permanently-open browser tab with auto-refresh:
+
+```bash
+pip install flask
+python3 status_ui.py                 # http://127.0.0.1:8765
+python3 status_ui.py --port 9876     # pick a port
+python3 status_ui.py --host 0.0.0.0  # bind on all interfaces (lan-visible)
+```
+
+The page renders one row per account with color-coded usage bars (green
+< 50 %, amber < 80 %, red ≥ 80 %), a badge if the account hit its limit,
+and the per-model `additional_rate_limits` (e.g. `GPT-5.3-Codex-Spark`)
+under each account. It refreshes itself every 60 seconds and caches the
+upstream call for 15 s so OpenAI is not hammered.
+
+`GET /api/status` returns the same data as JSON for programmatic use.
 
 The endpoint queried is `GET https://chatgpt.com/backend-api/wham/usage`,
 authenticated with the account's `access_token` and a `chatgpt-account-id`

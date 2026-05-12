@@ -4,9 +4,13 @@ Codex (OpenAI CLI) autologin via Camoufox + IMAP OTP.
 
 Usage:
     python codex_autologin.py <account-key> [--headed] [--debug]
+    python codex_autologin.py --all [--cooldown 30] [--force]
 
-Example:
-    python codex_autologin.py alice --headed
+Examples:
+    python codex_autologin.py alice                 # log in one account
+    python codex_autologin.py alice --headed        # watch Camoufox
+    python codex_autologin.py --all                 # bootstrap every account
+    python codex_autologin.py --all --force         # re-login everyone
 
 What it does:
     1. Reads accounts.json for credentials + IMAP config.
@@ -18,19 +22,19 @@ What it does:
     6. If OpenAI prompts for a 6-digit OTP, polls IMAP across INBOX, Junk
        and spam folders for the latest mail from noreply@tm.openai.com or
        otp@tm1.openai.com and submits the code.
-    7. OpenAI redirects to http://localhost:1455/auth/callback?code=...
-       codex login server captures the code, exchanges for tokens,
-       writes $CODEX_HOME/auth.json, exits 0.
-    8. We confirm with `codex login status`.
+    7. Browser is redirected to http://localhost:1455/auth/callback?code=...
+       (and then to /success). Codex's local server captures the code,
+       exchanges for tokens, writes $CODEX_HOME/auth.json, exits 0.
+    8. We confirm `auth.json` exists.
 
 Multi-account: each account gets its own dir under ./homes/<key>/, set as
 $CODEX_HOME for that account. Run `CODEX_HOME=./homes/alice codex` to use
 that account, independent from any other.
 
 Requires an IMAP mailbox to receive the OTP. If the IMAP mailbox and the
-OpenAI account share credentials (common with self-hosted mail), set just
-`email` and `password` per account. If they differ, set `imap_user` and
-`imap_password` explicitly. See accounts.example.json.
+OpenAI account share credentials, set just `email` + `password`. If they
+differ, set `imap_user` + `imap_password` per account. See
+accounts.example.json.
 """
 
 from __future__ import annotations
@@ -74,12 +78,7 @@ def load_accounts() -> dict:
 
 
 def pick_account(key: str, accounts: dict) -> tuple[str, str, str, str, dict]:
-    """Return (openai_email, openai_password, imap_user, imap_password, imap_cfg).
-
-    If `imap_user` / `imap_password` are missing in the account block, fall back
-    to `email` / `password` (common case where the IMAP mailbox and the OpenAI
-    account share credentials).
-    """
+    """Return (openai_email, openai_password, imap_user, imap_password, imap_cfg)."""
     if key not in accounts["accounts"]:
         sys.exit(f"unknown account '{key}'. available: {list(accounts['accounts'])}")
     a = accounts["accounts"][key]
@@ -465,17 +464,20 @@ def drive_auth(auth_url: str, email_addr: str, password: str,
                     time.sleep(1.5)
 
             # ---- STEP 5: wait for callback redirect ----
+            # codex's local server first sees /auth/callback?code=... then redirects
+            # the browser to /success?id_token=... — either URL on localhost:1455
+            # means the token exchange completed.
             log("waiting for redirect to localhost:1455 (codex callback)")
             try:
                 page.wait_for_url(
-                    re.compile(r"https?://localhost:1455/auth/callback.*"),
+                    re.compile(r"https?://localhost:1455/.*"),
                     timeout=30_000,
                 )
-                log("callback hit, codex should now exchange code for tokens")
+                log(f"localhost callback hit (url={page.url[:80]}...)")
                 _snap(page, debug, "09_callback_hit")
             except Exception:
                 _snap(page, debug, "99_redirect_failed")
-                log(f"redirect did not happen; final URL: {page.url}")
+                log(f"redirect did not happen; final URL: {page.url[:120]}")
                 raise
 
             time.sleep(3)  # codex finalizes
@@ -486,21 +488,31 @@ def drive_auth(auth_url: str, email_addr: str, password: str,
                 pass
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("account", help="account key from accounts.json (e.g. alice)")
-    ap.add_argument("--headed", action="store_true", help="run Camoufox visible (for debugging)")
-    ap.add_argument("--debug", action="store_true", help="dump screenshots/HTML on errors")
-    args = ap.parse_args()
+def is_logged_in(codex_home: Path) -> bool:
+    """Quick check: auth.json exists AND `codex login status` returns 0."""
+    auth_json = codex_home / "auth.json"
+    if not auth_json.exists():
+        return False
+    env = os.environ.copy()
+    env["BROWSER"] = "true"
+    env["CODEX_HOME"] = str(codex_home)
+    try:
+        r = subprocess.run(
+            ["codex", "login", "status"],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
-    accounts = load_accounts()
+
+def login_one(account_key: str, accounts: dict, headed: bool, debug: bool) -> bool:
+    """Run a full login flow for one account. Returns True on success."""
     email_addr, password, imap_user, imap_password, imap_cfg = pick_account(
-        args.account, accounts
+        account_key, accounts
     )
-
     HOMES_DIR.mkdir(exist_ok=True)
-    codex_home = HOMES_DIR / args.account
-
+    codex_home = HOMES_DIR / account_key
     proc, auth_url = spawn_codex_login(codex_home)
     try:
         drive_auth(
@@ -510,8 +522,8 @@ def main() -> None:
             imap_cfg=imap_cfg,
             mailbox=imap_user,
             mailbox_pw=imap_password,
-            headed=args.headed,
-            debug=args.debug,
+            headed=headed,
+            debug=debug,
         )
         log("waiting for codex login subprocess to exit")
         try:
@@ -524,12 +536,91 @@ def main() -> None:
         auth_json = codex_home / "auth.json"
         if auth_json.exists():
             log(f"SUCCESS: {auth_json} written ({auth_json.stat().st_size} bytes)")
-        else:
-            log("FAILED: auth.json missing")
-            sys.exit(2)
+            return True
+        log("FAILED: auth.json missing")
+        return False
+    except Exception as e:
+        # Camoufox may raise on a navigation we no longer care about
+        # (e.g. codex already wrote auth.json before the browser finished
+        # rendering /success). Re-check the file before reporting failure.
+        log(f"camoufox/drive_auth raised: {e}")
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        auth_json = codex_home / "auth.json"
+        if auth_json.exists():
+            log(f"SUCCESS (post-exception): {auth_json} written "
+                f"({auth_json.stat().st_size} bytes)")
+            return True
+        log("FAILED: auth.json missing after exception")
+        return False
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("account", nargs="?",
+                    help="account key from accounts.json (e.g. alice). "
+                         "Required unless --all is given.")
+    ap.add_argument("--all", action="store_true",
+                    help="log in every account from accounts.json sequentially")
+    ap.add_argument("--skip-logged-in", action="store_true", default=True,
+                    help="(default) skip accounts where `codex login status` already passes")
+    ap.add_argument("--force", action="store_true",
+                    help="re-login even if already logged in (cancels --skip-logged-in)")
+    ap.add_argument("--cooldown", type=int, default=30,
+                    help="seconds to sleep between accounts in --all mode (default: 30)")
+    ap.add_argument("--headed", action="store_true",
+                    help="run Camoufox visible (for debugging)")
+    ap.add_argument("--debug", action="store_true",
+                    help="dump screenshots/HTML on every step")
+    args = ap.parse_args()
+
+    accounts = load_accounts()
+
+    if args.all:
+        keys = list(accounts["accounts"].keys())
+        log(f"--all mode: {len(keys)} accounts -> {keys}")
+        results: dict[str, str] = {}
+        for i, key in enumerate(keys):
+            log(f"\n========== [{i+1}/{len(keys)}] {key} ==========")
+            codex_home = HOMES_DIR / key
+            if not args.force and args.skip_logged_in and is_logged_in(codex_home):
+                log(f"skip: {key} already logged in")
+                results[key] = "skipped"
+                continue
+            try:
+                ok = login_one(key, accounts, headed=args.headed, debug=args.debug)
+                results[key] = "ok" if ok else "failed"
+            except Exception as e:
+                log(f"{key} crashed: {e}")
+                results[key] = f"crashed:{e}"
+            # cooldown so OpenAI doesn't flag 7 logins in 2 minutes from one IP
+            if i < len(keys) - 1 and args.cooldown > 0:
+                log(f"cooldown {args.cooldown}s before next account")
+                time.sleep(args.cooldown)
+
+        # summary
+        log("\n========== SUMMARY ==========")
+        for k, v in results.items():
+            log(f"  {k:<14} {v}")
+        n_ok = sum(1 for v in results.values() if v in ("ok", "skipped"))
+        log(f"\n{n_ok}/{len(keys)} accounts ready")
+        sys.exit(0 if n_ok == len(keys) else 1)
+
+    if not args.account:
+        ap.error("account is required (or use --all)")
+    if not args.force and args.skip_logged_in:
+        codex_home = HOMES_DIR / args.account
+        if is_logged_in(codex_home):
+            log(f"{args.account} already logged in (use --force to re-login)")
+            sys.exit(0)
+
+    ok = login_one(args.account, accounts, headed=args.headed, debug=args.debug)
+    sys.exit(0 if ok else 2)
 
 
 if __name__ == "__main__":
