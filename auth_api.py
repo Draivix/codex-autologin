@@ -38,7 +38,7 @@ GET    /v1/accounts/<name>                       — account metadata (no secret
 POST   /v1/accounts                              — create account (admin)
 PATCH  /v1/accounts/<name>                       — update creds (admin)
 DELETE /v1/accounts/<name>                       — remove account + homes/<n>/ (admin)
-GET    /v1/accounts/<name>/status                — live /wham/usage data
+GET    /v1/accounts/<name>/status                — live /wham/usage data (15s cache)
 GET    /v1/accounts/<name>/auth                  — return auth.json (the secret)
 DELETE /v1/accounts/<name>/auth                  — local logout: drop auth.json (admin)
 POST   /v1/accounts/<name>/reconnect             — re-login in background (admin)
@@ -53,10 +53,20 @@ GET    /v1/imap                                  — current IMAP config (admin)
 PUT    /v1/imap                                  — update IMAP host/port/ssl (admin)
 GET    /v1/audit?limit=N                         — tail audit log (admin)
 
+Concurrency
+-----------
+- HTTP requests run on a waitress thread pool (default 8 threads). All
+  read-only endpoints (auth, status, accounts, keys, audit) are safe to
+  hit in parallel; /status responses are cached 15 s per account.
+- Across-account /reconnect is serialized globally: only one codex login
+  subprocess runs at any time (port 1455 collision otherwise). A second
+  reconnect call while one is running gets 503 with the busy account
+  name; per-account duplicates get 409.
+
 Usage
 -----
     pip install flask waitress
-    # 1. mint the first admin key (only CLI can do this when no key exists)
+    # 1. mint the first admin key (CLI; the API itself cannot mint without auth)
     python3 apikey_admin.py generate --label admin --scope '*'
     # 2. run server (waitress in production)
     python3 auth_api.py --port 8788 --behind-proxy
@@ -123,12 +133,14 @@ def _load_keys() -> dict:
 
 def _save_keys(data: dict) -> None:
     global _keys_cache, _keys_mtime
-    tmp = KEYS_FILE.with_suffix(".tmp")
-    with tmp.open("w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o600)
-    tmp.replace(KEYS_FILE)
+    # Hold the lock for the whole write-rename sequence so concurrent
+    # bump_usage / keys_update do not race on the temp filename.
     with _keys_lock:
+        tmp = KEYS_FILE.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(tmp, 0o600)
+        tmp.replace(KEYS_FILE)
         _keys_cache = data
         _keys_mtime = KEYS_FILE.stat().st_mtime
 
@@ -303,11 +315,12 @@ def load_accounts() -> dict:
 
 
 def save_accounts(data: dict) -> None:
-    tmp = ACCOUNTS_FILE.with_suffix(".tmp")
-    with tmp.open("w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.chmod(tmp, 0o600)
-    tmp.replace(ACCOUNTS_FILE)
+    with _accounts_lock:
+        tmp = ACCOUNTS_FILE.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        tmp.replace(ACCOUNTS_FILE)
 
 
 def safe_account_name(name: str) -> bool:
@@ -352,30 +365,61 @@ def account_status_meta(name: str) -> dict:
 
 
 # ---------------- Reconnect (refresh) tracking ----------------
+# A single codex login subprocess binds local port 1455 (with fallback). To
+# safely run reconnects for different accounts we serialize them globally:
+# at most ONE codex login subprocess at a time across the whole server.
+# Per-account dedup is also enforced (a re-trigger for an already-running
+# account returns 409 instead of queueing).
 _reconnect_lock = threading.Lock()
 _reconnect_state: dict[str, dict] = {}
 # {account: {pid, started_at, finished_at|None, exit_code|None, log_path}}
 
+_global_login_lock = threading.Lock()         # held for the duration of one codex login
+_global_login_account: str | None = None      # which account currently holds the lock
+
+# /status response cache: account -> (timestamp, payload). 15s TTL.
+_status_cache: dict[str, tuple[float, dict]] = {}
+STATUS_CACHE_TTL = 15.0
+
 
 def _wait_proc(account: str, proc: subprocess.Popen, log_path: Path) -> None:
-    """Background thread: wait on the autologin subprocess and record outcome."""
-    rc = proc.wait()
-    with _reconnect_lock:
-        st = _reconnect_state.get(account)
-        if st is not None:
-            st["finished_at"] = datetime.now(timezone.utc).isoformat()
-            st["exit_code"] = rc
+    """Background thread: wait on the autologin subprocess and record outcome.
+    Also releases the global login lock."""
+    global _global_login_account
+    try:
+        rc = proc.wait()
+    finally:
+        with _reconnect_lock:
+            st = _reconnect_state.get(account)
+            if st is not None:
+                st["finished_at"] = datetime.now(timezone.utc).isoformat()
+                st["exit_code"] = locals().get("rc")
+        _global_login_account = None
+        try:
+            _global_login_lock.release()
+        except RuntimeError:
+            # lock might already have been released on early-exit path; ignore.
+            pass
 
 
-def spawn_reconnect(account: str) -> tuple[bool, str]:
-    """Spawn the autologin in the background for `account`. Returns (ok, message)."""
+def spawn_reconnect(account: str) -> tuple[bool, str, int]:
+    """Spawn the autologin in the background for `account`.
+    Returns (ok, message, http_status_hint)."""
+    global _global_login_account
     script = ROOT / "codex_autologin.py"
     if not script.exists():
-        return False, "autologin script missing"
+        return False, "autologin script missing", 500
+    # per-account dedup
     with _reconnect_lock:
         cur = _reconnect_state.get(account)
         if cur and cur.get("finished_at") is None:
-            return False, "reconnect already in progress"
+            return False, "reconnect already in progress for this account", 409
+    # global serialization: try to acquire without blocking the HTTP thread
+    if not _global_login_lock.acquire(blocking=False):
+        return (False,
+                f"server busy: another login is running for "
+                f"{_global_login_account or 'another account'}", 503)
+    _global_login_account = account
     log_dir = ROOT / "reconnect_logs"
     log_dir.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -389,7 +433,12 @@ def spawn_reconnect(account: str) -> tuple[bool, str]:
             start_new_session=True,
         )
     except Exception as e:
-        return False, f"spawn failed: {e}"
+        _global_login_account = None
+        try:
+            _global_login_lock.release()
+        except RuntimeError:
+            pass
+        return False, f"spawn failed: {e}", 500
     with _reconnect_lock:
         _reconnect_state[account] = {
             "pid": proc.pid,
@@ -400,7 +449,7 @@ def spawn_reconnect(account: str) -> tuple[bool, str]:
         }
     threading.Thread(target=_wait_proc, args=(account, proc, log_path),
                      daemon=True).start()
-    return True, "started"
+    return True, "started", 202
 
 
 def reconnect_status(account: str) -> dict:
@@ -460,13 +509,19 @@ def build_app(behind_proxy: bool) -> Flask:
         auth_path = HOMES / account / "auth.json"
         if not auth_path.exists():
             return deny("status", account, key_id, 404, ip, "no auth.json")
-        # Lazy import to avoid loading status helpers when unused
+        # 15s cache to keep openai backend traffic sane when many clients poll.
+        now = time.time()
+        cached = _status_cache.get(account)
+        if cached and now - cached[0] < STATUS_CACHE_TTL:
+            audit("status", account, key_id, 200, ip, {"cache": "hit"})
+            return secure_headers(jsonify(cached[1]))
         from codex_status import fetch_usage  # type: ignore
         try:
             data = fetch_usage(auth_path)
         except Exception as e:
             return deny("status", account, key_id, 502, ip, f"upstream: {e}")
-        audit("status", account, key_id, 200, ip)
+        _status_cache[account] = (now, data)
+        audit("status", account, key_id, 200, ip, {"cache": "miss"})
         return secure_headers(jsonify(data))
 
     @app.route("/v1/accounts/<account>/auth")
@@ -559,7 +614,7 @@ def build_app(behind_proxy: bool) -> Flask:
               {"email": email_addr, "login_requested": do_login})
         out = {"name": name, "email": email_addr, "in_config": True, "has_auth": False}
         if do_login:
-            ok, msg = spawn_reconnect(name)
+            ok, msg, _ = spawn_reconnect(name)
             out["login_spawn"] = msg
             if not ok:
                 out["login_error"] = True
@@ -671,9 +726,9 @@ def build_app(behind_proxy: bool) -> Flask:
             acc = load_accounts().get("accounts", {}).get(account)
         if not acc:
             return deny("reconnect", account, key_id, 404, ip, "no creds in accounts.json")
-        ok, msg = spawn_reconnect(account)
+        ok, msg, http_status = spawn_reconnect(account)
         if not ok:
-            return deny("reconnect", account, key_id, 409, ip, msg)
+            return deny("reconnect", account, key_id, http_status, ip, msg)
         audit("reconnect", account, key_id, 202, ip)
         return secure_headers(jsonify(status="started", message=msg)), 202
 

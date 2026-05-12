@@ -16,25 +16,20 @@ What it does:
     1. Reads accounts.json for credentials + IMAP config.
     2. Spawns `codex login` (with BROWSER=true so it never hijacks the real
        desktop browser via xdg-open).
-    3. Parses the auth URL from codex stderr.
+    3. Parses the auth URL (and its callback port) from codex stderr.
     4. Launches Camoufox (stealth Firefox), navigates to the auth URL.
     5. Fills email -> continue, password -> continue.
     6. If OpenAI prompts for a 6-digit OTP, polls IMAP across INBOX, Junk
        and spam folders for the latest mail from noreply@tm.openai.com or
        otp@tm1.openai.com and submits the code.
-    7. Browser is redirected to http://localhost:1455/auth/callback?code=...
-       (and then to /success). Codex's local server captures the code,
+    7. Browser is redirected to http://localhost:<port>/auth/callback?code=...
+       (and then /success). Codex's local server captures the code,
        exchanges for tokens, writes $CODEX_HOME/auth.json, exits 0.
-    8. We confirm `auth.json` exists.
+    8. We confirm auth.json exists.
 
 Multi-account: each account gets its own dir under ./homes/<key>/, set as
 $CODEX_HOME for that account. Run `CODEX_HOME=./homes/alice codex` to use
 that account, independent from any other.
-
-Requires an IMAP mailbox to receive the OTP. If the IMAP mailbox and the
-OpenAI account share credentials, set just `email` + `password`. If they
-differ, set `imap_user` + `imap_password` per account. See
-accounts.example.json.
 """
 
 from __future__ import annotations
@@ -269,12 +264,30 @@ def _find_otp_input(page):
     return None, 0
 
 
+def _parse_callback_port(auth_url: str) -> int:
+    """Extract the port from the redirect_uri query parameter.
+
+    Codex defaults to 1455 but can fall back to a different port if 1455 is
+    in use; the actual port is in the OAuth authorize URL it printed."""
+    import urllib.parse
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
+        redirect = qs.get("redirect_uri", [""])[0]
+        if not redirect:
+            return 1455
+        port = urllib.parse.urlparse(redirect).port
+        return int(port) if port else 1455
+    except Exception:
+        return 1455
+
+
 def drive_auth(auth_url: str, email_addr: str, password: str,
                imap_cfg: dict, mailbox: str, mailbox_pw: str,
                headed: bool, debug: bool) -> None:
     """Run Camoufox, walk through OpenAI login screens."""
     started_at = time.time()
-    log(f"launching Camoufox headed={headed}")
+    callback_port = _parse_callback_port(auth_url)
+    log(f"launching Camoufox headed={headed}  callback_port={callback_port}")
     with Camoufox(
         headless=not headed,
         humanize=True,
@@ -306,13 +319,14 @@ def drive_auth(auth_url: str, email_addr: str, password: str,
             # wait for any of: password input, OTP input, or callback redirect
             try:
                 page.wait_for_function(
-                    """() => {
-                        if (location.href.includes('localhost:1455')) return true;
+                    """(port) => {
+                        if (location.href.includes('localhost:' + port)) return true;
                         if (document.querySelector('input[type=password]')) return true;
                         if (document.querySelector('input[autocomplete=one-time-code]')) return true;
                         if (document.querySelector('input[name=code]')) return true;
                         return false;
                     }""",
+                    arg=callback_port,
                     timeout=25_000,
                 )
             except Exception as e:
@@ -336,14 +350,15 @@ def drive_auth(auth_url: str, email_addr: str, password: str,
                 log("submitted password -> waiting for OTP/redirect")
                 try:
                     page.wait_for_function(
-                        """() => {
-                            if (location.href.includes('localhost:1455')) return true;
+                        """(port) => {
+                            if (location.href.includes('localhost:' + port)) return true;
                             if (document.querySelector('input[autocomplete=one-time-code]')) return true;
                             if (document.querySelector('input[name=code]')) return true;
                             if (location.href.includes('email-verification')) return true;
                             if (location.href.includes('mfa')) return true;
                             return false;
                         }""",
+                        arg=callback_port,
                         timeout=20_000,
                     )
                 except Exception as e:
@@ -439,7 +454,7 @@ def drive_auth(auth_url: str, email_addr: str, password: str,
             )
             cancel_names = (r"^cancel$", r"^zrušit$", r"^zrusit$")
             while time.time() < deadline:
-                if "localhost:1455" in page.url:
+                if f"localhost:{callback_port}" in page.url:
                     break
                 clicked = False
                 for name_re in interstitial_names:
@@ -465,12 +480,12 @@ def drive_auth(auth_url: str, email_addr: str, password: str,
 
             # ---- STEP 5: wait for callback redirect ----
             # codex's local server first sees /auth/callback?code=... then redirects
-            # the browser to /success?id_token=... — either URL on localhost:1455
-            # means the token exchange completed.
-            log("waiting for redirect to localhost:1455 (codex callback)")
+            # the browser to /success?id_token=... — either URL on the parsed
+            # callback port means the token exchange completed.
+            log(f"waiting for redirect to localhost:{callback_port} (codex callback)")
             try:
                 page.wait_for_url(
-                    re.compile(r"https?://localhost:1455/.*"),
+                    re.compile(rf"https?://localhost:{callback_port}/.*"),
                     timeout=30_000,
                 )
                 log(f"localhost callback hit (url={page.url[:80]}...)")
